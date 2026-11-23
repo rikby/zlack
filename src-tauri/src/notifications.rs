@@ -1,4 +1,10 @@
 use serde::Serialize;
+use tauri::Manager;
+
+use crate::{
+    security,
+    windowing::{self, Document, PageEvent},
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,8 +22,8 @@ impl NotificationActivation {
     ) -> Self {
         Self {
             notification_id,
-            team_id: usable_context_value(team_id),
-            channel_id: usable_context_value(channel_id),
+            team_id: usable_context_value(team_id, security::valid_team),
+            channel_id: usable_context_value(channel_id, security::valid_channel),
         }
     }
 
@@ -35,57 +41,37 @@ impl NotificationActivation {
     }
 
     pub(crate) fn update_context(&mut self, team_id: Option<String>, channel_id: Option<String>) {
-        self.team_id = usable_context_value(team_id);
-        self.channel_id = usable_context_value(channel_id);
+        self.team_id = usable_context_value(team_id, security::valid_team);
+        self.channel_id = usable_context_value(channel_id, security::valid_channel);
     }
 }
 
-fn usable_context_value(value: Option<String>) -> Option<String> {
+fn usable_context_value(value: Option<String>, valid: fn(&str) -> bool) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
-        (!value.is_empty() && value != "unknown").then(|| value.to_string())
+        valid(value).then(|| value.to_string())
     })
-}
-
-pub(crate) fn activation_script(
-    activation: &NotificationActivation,
-) -> Result<String, serde_json::Error> {
-    let payload = serde_json::to_string(activation)?;
-    let fallback_url = serde_json::to_string(&activation.target_url())?;
-    Ok(format!(
-        r#"(function(payload, fallbackUrl) {{
-            try {{
-                if (typeof window.__ZlackActivateNotification === "function") {{
-                    window.__ZlackActivateNotification(payload);
-                    return;
-                }}
-            }} catch (error) {{
-                console.error("Zlack: Notification activation bridge failed", error);
-            }}
-            if (fallbackUrl && window.location.href !== fallbackUrl) {{
-                window.location.href = fallbackUrl;
-            }}
-        }})({payload}, {fallback_url});"#
-    ))
 }
 
 pub(crate) fn activate_native_notification(
     app: &tauri::AppHandle,
     origin_label: &str,
+    document: Option<Document>,
     activation: NotificationActivation,
 ) {
-    if let Some(window) = crate::focus_workspace_label(app, origin_label) {
-        match activation_script(&activation) {
-            Ok(script) => match window.eval(&script) {
-                Ok(()) => return,
-                Err(error) => {
-                    eprintln!(
-                        "Zlack: Failed to deliver notification activation to {origin_label}: {error}"
-                    );
-                }
-            },
-            Err(error) => {
-                eprintln!("Zlack: Failed to serialize notification activation: {error}");
+    if let (Some(window), Some(document)) = (app.get_webview_window(origin_label), document) {
+        if windowing::document_is_current(&window, &document) {
+            if let Some(window) = crate::focus_workspace_label(app, origin_label) {
+                let target = activation
+                    .target_url()
+                    .and_then(|url| url::Url::parse(&url).ok());
+                windowing::send_document_event(
+                    &window,
+                    document,
+                    PageEvent::Notification(activation),
+                    target,
+                );
+                return;
             }
         }
     }
@@ -99,60 +85,55 @@ pub(crate) fn activate_native_notification(
 
 #[cfg(test)]
 mod tests {
-    use super::{activation_script, NotificationActivation};
+    use super::NotificationActivation;
 
     #[test]
     fn builds_channel_fallback_only_with_valid_context() {
         let channel = NotificationActivation::new(
             "notification-1".to_string(),
-            Some("T123".to_string()),
-            Some("C456".to_string()),
+            Some("T0123456".to_string()),
+            Some("C0123456".to_string()),
         );
         let workspace = NotificationActivation::new(
             "notification-2".to_string(),
-            Some("T123".to_string()),
+            Some("T0123456".to_string()),
             None,
         );
         let unknown = NotificationActivation::new("notification-3".to_string(), None, None);
 
         assert_eq!(
             channel.target_url().as_deref(),
-            Some("https://app.slack.com/client/T123/C456")
+            Some("https://app.slack.com/client/T0123456/C0123456")
         );
         assert_eq!(
             workspace.target_url().as_deref(),
-            Some("https://app.slack.com/client/T123")
+            Some("https://app.slack.com/client/T0123456")
         );
         assert_eq!(unknown.target_url(), None);
     }
 
     #[test]
-    fn serializes_activation_for_the_originating_preload() {
+    fn ignores_invalid_context_values() {
         let activation = NotificationActivation::new(
-            "notification-\"quoted".to_string(),
-            Some("T123".to_string()),
-            Some("D456".to_string()),
+            "notification-2".to_string(),
+            Some("T0123456".to_string()),
+            Some("C0123456/other".to_string()),
         );
-
-        let script = activation_script(&activation).expect("activation serializes");
-
-        assert!(script.contains("window.__ZlackActivateNotification"));
-        assert!(script.contains(r#""notificationId":"notification-\"quoted""#));
-        assert!(script.contains(r#""teamId":"T123""#));
-        assert!(script.contains(r#""channelId":"D456""#));
-        assert!(script.contains("window.location.href"));
-        assert!(script.contains("https://app.slack.com/client/T123/D456"));
+        assert_eq!(
+            activation.target_url().as_deref(),
+            Some("https://app.slack.com/client/T0123456"),
+        );
     }
 
     #[test]
     fn updates_a_pending_activation_with_late_context() {
         let mut activation = NotificationActivation::new("notification-1".to_string(), None, None);
 
-        activation.update_context(Some("T123".to_string()), Some("D456".to_string()));
+        activation.update_context(Some("T0123456".to_string()), Some("D0123456".to_string()));
 
         assert_eq!(
             activation.target_url().as_deref(),
-            Some("https://app.slack.com/client/T123/D456")
+            Some("https://app.slack.com/client/T0123456/D0123456")
         );
     }
 }

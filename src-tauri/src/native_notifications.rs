@@ -9,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::notifications::{activate_native_notification, NotificationActivation};
+use crate::{
+    notifications::{activate_native_notification, NotificationActivation},
+    windowing::{self, Document},
+};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
@@ -28,6 +31,7 @@ use windows as backend;
 struct PendingNativeNotification {
     app_handle: tauri::AppHandle,
     origin_label: String,
+    document: Option<Document>,
     activation: NotificationActivation,
     created_at: Instant,
 }
@@ -103,6 +107,7 @@ fn remove_expired_notifications(notifications: &mut HashMap<String, PendingNativ
 fn register_pending_notification(
     app_handle: tauri::AppHandle,
     origin_label: String,
+    document: Option<Document>,
     activation: NotificationActivation,
 ) -> String {
     let notification_id = activation.notification_id().to_string();
@@ -114,6 +119,7 @@ fn register_pending_notification(
         PendingNativeNotification {
             app_handle,
             origin_label,
+            document,
             activation,
             created_at,
         },
@@ -130,6 +136,13 @@ fn register_pending_notification(
     notification_id
 }
 
+pub(crate) fn forget_workspace(label: &str) {
+    pending_notifications()
+        .lock()
+        .unwrap()
+        .retain(|_, entry| entry.origin_label != label);
+}
+
 pub(super) fn remove_pending_notification(notification_id: &str) {
     pending_notifications()
         .lock()
@@ -144,18 +157,24 @@ pub(super) fn dispatch_pending_notification(notification_id: &str) {
         notifications.remove(notification_id)
     };
     if let Some(pending) = pending {
-        dispatch_activation(pending.app_handle, pending.origin_label, pending.activation);
+        dispatch_activation(
+            pending.app_handle,
+            pending.origin_label,
+            pending.document,
+            pending.activation,
+        );
     }
 }
 
 fn dispatch_activation(
     app_handle: tauri::AppHandle,
     origin_label: String,
+    document: Option<Document>,
     activation: NotificationActivation,
 ) {
     let dispatcher = app_handle.clone();
     if let Err(error) = dispatcher.run_on_main_thread(move || {
-        activate_native_notification(&app_handle, &origin_label, activation);
+        activate_native_notification(&app_handle, &origin_label, document, activation);
     }) {
         eprintln!("Zlack: Failed to dispatch notification activation: {error}");
     }
@@ -163,6 +182,7 @@ fn dispatch_activation(
 
 #[tauri::command]
 pub(crate) fn update_notification_context(
+    window: tauri::WebviewWindow,
     notification_id: String,
     team_id: Option<String>,
     channel_id: Option<String>,
@@ -170,7 +190,14 @@ pub(crate) fn update_notification_context(
     let mut notifications = pending_notifications().lock().unwrap();
     remove_expired_notifications(&mut notifications);
     if let Some(pending) = notifications.get_mut(&notification_id) {
-        pending.activation.update_context(team_id, channel_id);
+        if pending.origin_label == window.label()
+            && pending
+                .document
+                .as_ref()
+                .is_some_and(|document| windowing::document_is_current(&window, document))
+        {
+            pending.activation.update_context(team_id, channel_id);
+        }
     }
 }
 
@@ -185,8 +212,12 @@ pub(crate) fn notify(
     channel_id: Option<String>,
 ) {
     let activation = NotificationActivation::new(notification_id, team_id, channel_id);
-    let notification_id =
-        register_pending_notification(app_handle.clone(), window.label().to_string(), activation);
+    let notification_id = register_pending_notification(
+        app_handle.clone(),
+        window.label().to_string(),
+        windowing::current_document(&window),
+        activation,
+    );
     backend::show(&app_handle, notification_id, title, body);
 }
 

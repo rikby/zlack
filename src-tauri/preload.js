@@ -1,5 +1,7 @@
 
 // Preload script to bridge Slack notifications to Tauri
+let zlackApplyWorkspaceStatus = () => {};
+const zlackNativeBridge = window.webkit?.messageHandlers?.zlack;
 
 // 1. MOCK Service Workers
 if (window.navigator) {
@@ -187,7 +189,7 @@ const ZlackNotification =
         logError: (...args) => console.error(...args),
     });
 
-window.__ZlackActivateNotification = function(payload) {
+function zlackActivateNotification(payload) {
     if (notificationCoordinator.activateNotification(payload || {})) {
         return true;
     }
@@ -204,7 +206,7 @@ window.__ZlackActivateNotification = function(payload) {
         console.error('Zlack: Notification fallback navigation failed', error);
     });
     return false;
-};
+}
 
 // Force the shim to stay
 Object.defineProperty(window, 'Notification', {
@@ -357,6 +359,14 @@ function currentTauriInvoke() {
 
 function tauriInvoke(command, args, timeoutMs = 10000) {
     const started = Date.now();
+    if (zlackNativeBridge) {
+        return zlackNativeBridge.postMessage(JSON.stringify({ command, args: args ?? {} }))
+            .then((json) => {
+                const response = JSON.parse(json);
+                if (!response.ok) throw response.value;
+                return response.value;
+            });
+    }
     return new Promise((resolve, reject) => {
         function attempt() {
             const invoke = currentTauriInvoke();
@@ -1021,7 +1031,7 @@ function processBadgeSocketMessage(data) {
         tauriInvoke('switch_workspace', { team, url: null }).catch(() => {});
     }
 
-    window.__ZlackWorkspaceStatus = applyWorkspaceStatus;
+    zlackApplyWorkspaceStatus = applyWorkspaceStatus;
     window.addEventListener('zlack-badge-state-changed', scheduleWorkspaceButtonsRender);
 
     function switchInfoFromSwitcherButton(target) {
@@ -1078,10 +1088,11 @@ function processBadgeSocketMessage(data) {
         if (anchor) {
             try {
                 const url = new URL(anchor.href, window.location.href);
-                if (/slack\.com$/i.test(url.hostname) || /\.slack\.com$/i.test(url.hostname)) {
-                    const m = url.pathname.match(/^\/client\/([^/]+)(?:\/([^/?#]+))?/);
+                if (zlackIsSlackUrl(url)) {
+                    const m = url.pathname.match(/^\/client\/([TE][A-Z0-9]{7,})(?:\/|$)/);
                     if (m) {
                         team = m[1];
+                        url.hostname = 'app.slack.com';
                         switchUrl = url.href;
                     }
                 }
@@ -1228,7 +1239,8 @@ function zlackIsHttpUrl(url) {
 }
 
 function zlackIsSlackUrl(url) {
-    return url && url.protocol === 'https:' && ZLACK_SLACK_HOST_RE.test(url.hostname || '');
+    return url && url.protocol === 'https:' && !url.port && !url.username && !url.password
+        && ZLACK_SLACK_HOST_RE.test(url.hostname || '');
 }
 
 function zlackIsSlackAppPath(pathname) {
@@ -1250,7 +1262,13 @@ function zlackSlackAppHref(href) {
     const url = zlackUrl(href);
     if (!zlackIsSlackUrl(url) || !zlackIsSlackAppPath(url.pathname)) return null;
 
-    if (/^\/client(?:\/|$)/i.test(url.pathname)) return url.href;
+    if (/^\/client(?:\/|$)/.test(url.pathname)) {
+        if (url.hostname !== 'app.slack.com') {
+            if (!/^\/client\/[TE][A-Z0-9]{7,}(?:\/|$)/.test(url.pathname)) return null;
+            url.hostname = 'app.slack.com';
+        }
+        return url.href;
+    }
 
     const team = zlackTeamForSlackUrl(url);
     const archiveMessageMatch = url.pathname.match(/^\/archives\/([^/?#]+)\/p(\d{10})(\d{6})/i);
@@ -1318,12 +1336,9 @@ function zlackOpenSlackUrlInCurrentWindow(href) {
     return true;
 }
 
-window.__ZlackNavigateSlackUrl = zlackOpenSlackUrlInCurrentWindow;
-
 // Slack pages that are not client routes (sign-in, "Add a workspace", help).
-// Sign-in flows must stay in this WebView so the new workspace's session is
-// stored with the others; everything else goes to the OS browser. Returns
-// false when the URL is not one of these pages. See slack-navigation.cjs.
+// Native navigation routes sign-in to a separate WebView sharing the fork's
+// session store. Slack links outside the client and sign-in open in the browser.
 function zlackOpenSlackPage(href) {
     const route = ZlackSlackNavigation.classify(href, window.location.href);
     const parsed = zlackUrl(href);
@@ -1339,8 +1354,7 @@ function zlackOpenSlackPage(href) {
 }
 
 // Slack sometimes opens a blank window first and points it at a URL later.
-// The WebView never creates that window, so hand Slack a stand-in whose
-// navigation is routed like a direct window.open(url).
+// Hand it a stand-in so the destination goes through the usual native policy.
 function zlackDeferredWindow() {
     const navigate = (value) => {
         const href = value && String(value);
@@ -1447,8 +1461,7 @@ document.addEventListener('click', (e) => {
 
 
 // 5. Slack attachment downloads (fetch -> IPC).
-// Keep in sync with MAX_FILE_BYTES in downloads.rs.
-const ZLACK_MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
+const zlackRunDownload = ZlackDownloads.createLimiter();
 
 // Only intercept links with clear download intent: Slack's own download
 // buttons carry a `download` attribute, and the canonical attachment URLs
@@ -1459,9 +1472,9 @@ function zlackIsSlackFileDownload(anchor, parsed) {
     return anchor.hasAttribute('download') || /\/download\//i.test(parsed.pathname);
 }
 
-function zlackAuthenticatedFetch(url) {
-    const fetchImpl = typeof originalFetch === 'function' ? originalFetch : window.fetch;
-    return fetchImpl(url, { credentials: 'include', cache: 'no-store' });
+function zlackAuthenticatedFetch(url, signal) {
+    if (!ZlackDownloads.isDownloadUrl(url)) throw new Error('Unexpected download source');
+    return originalFetch.call(window, url, { credentials: 'include', cache: 'no-store', signal });
 }
 
 function zlackToBase64(bytes) {
@@ -1541,22 +1554,20 @@ function zlackNotifySaved(savedPath) {
 
 async function zlackDownloadFile(url, anchor) {
     try {
-        const response = await zlackAuthenticatedFetch(url);
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const disposition = response.headers.get('content-disposition');
-        const blob = await response.blob();
-        if (!blob.size) throw new Error('empty file');
-        if (blob.size > ZLACK_MAX_DOWNLOAD_BYTES) throw new Error('file is too large to download');
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const filename = zlackResolveFilename({
-            disposition,
-            element: anchor,
-            url,
-            fallbackStem: 'slack-file',
-        });
-        const savedPath = await tauriInvoke('save_file', {
-            filename,
-            dataBase64: zlackToBase64(bytes),
+        const savedPath = await zlackRunDownload(async (signal, keepReading, doneReading) => {
+            const response = await zlackAuthenticatedFetch(url, signal);
+            const blob = await ZlackDownloads.readBlob(response, ZlackDownloads.fileLimit, keepReading);
+            doneReading();
+            const filename = zlackResolveFilename({
+                disposition: response.headers.get('content-disposition'),
+                element: anchor,
+                url,
+                fallbackStem: 'slack-file',
+            });
+            return tauriInvoke('save_file', {
+                filename,
+                dataBase64: zlackToBase64(new Uint8Array(await blob.arrayBuffer())),
+            });
         });
         zlackNotifySaved(savedPath);
     } catch (error) {
@@ -1631,25 +1642,25 @@ function zlackErrorText(error) {
     window.addEventListener('pointerdown', onMenuPointer, true);
     window.addEventListener('click', onMenuPointer, true);
 
-    async function fetchImageBlob(url) {
-        const response = await zlackAuthenticatedFetch(url);
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const blob = await response.blob();
-        if (!blob.size) throw new Error('empty image');
+    async function fetchImageBlob(url, signal, keepReading, doneReading) {
+        const response = await zlackAuthenticatedFetch(url, signal);
+        const blob = await ZlackDownloads.readBlob(response, ZlackDownloads.imageLimit, keepReading);
+        doneReading();
         return blob;
     }
 
     async function saveImage(url, element) {
-        const blob = await fetchImageBlob(url);
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const savedPath = await tauriInvoke('save_image', {
-            filename: zlackResolveFilename({
-                element,
-                url,
-                fallbackStem: 'slack-image',
-            }),
-            mime: blob.type || '',
-            dataBase64: zlackToBase64(bytes),
+        const savedPath = await zlackRunDownload(async (signal, keepReading, doneReading) => {
+            const blob = await fetchImageBlob(url, signal, keepReading, doneReading);
+            return tauriInvoke('save_image', {
+                filename: zlackResolveFilename({
+                    element,
+                    url,
+                    fallbackStem: 'slack-image',
+                }),
+                mime: blob.type || '',
+                dataBase64: zlackToBase64(new Uint8Array(await blob.arrayBuffer())),
+            });
         });
         zlackNotifySaved(savedPath);
         return savedPath;
@@ -1682,9 +1693,10 @@ function zlackErrorText(error) {
         }
         // Hand the ClipboardItem a promise so clipboard.write starts inside
         // the pointer action's user-activation window instead of after the fetch.
-        const png = fetchImageBlob(url).then(
-            (blob) => (blob.type === 'image/png' ? blob : toPngBlob(blob))
-        );
+        const png = zlackRunDownload(async (signal, keepReading, doneReading) => {
+            const blob = await fetchImageBlob(url, signal, keepReading, doneReading);
+            return blob.type === 'image/png' ? blob : toPngBlob(blob);
+        });
         await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
     }
 
@@ -1777,6 +1789,29 @@ function zlackErrorText(error) {
     }, true);
 })();
 
+function zlackPageEvent(event) {
+    if (window.location.origin !== 'https://app.slack.com'
+        || !/^\/(?:client|archives)(?:\/|$)/.test(window.location.pathname)) return;
+    switch (event.type) {
+        case 'workspaceStatus': zlackApplyWorkspaceStatus(event.value); break;
+        case 'notification': zlackActivateNotification(event.value); break;
+        case 'navigate': zlackOpenSlackUrlInCurrentWindow(event.value); break;
+    }
+}
 
-
+if (zlackNativeBridge) {
+    async function watchPageEvents() {
+        while (true) {
+            try {
+                const json = await zlackNativeBridge.postMessage('watch');
+                zlackPageEvent(JSON.parse(json));
+            } catch (_) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+        }
+    }
+    void watchPageEvents();
+} else {
+    window.__ZlackPageEvent = zlackPageEvent;
+}
 
