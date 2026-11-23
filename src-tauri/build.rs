@@ -14,13 +14,15 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("macos/notification.m")
+            .file("macos/webview.m")
             .flag("-fobjc-arc")
             .compile("zlack_macos_notification");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=WebKit");
+        println!("cargo:rerun-if-changed=macos/webview.m");
     }
 
     // Declaring the app manifest makes every command deny-by-default, so only

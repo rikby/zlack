@@ -46,12 +46,18 @@ jobs:
       - name: Sync version metadata
         run: npm run update-version
 
+      - name: Test JavaScript
+        run: node --test
+
+      - name: Test Rust (locked)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
       # Advisory lint pass; does not fail the build (the codebase predates a
       # clippy-clean baseline). Tighten to `-- -D warnings` once it is clean.
       - name: Clippy (advisory)
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets
 
       # Hard gate: the Rust backend must compile on every target OS. This is what
       # catches issues like a removed-but-still-needed dependency.
       - name: Compile (debug)
-        run: cargo build --manifest-path src-tauri/Cargo.toml --verbose
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked --verbose

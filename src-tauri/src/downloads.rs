@@ -1,4 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, TryLockError},
+    time::{Duration, Instant},
+};
 
 use base64::Engine as _;
 use serde::Serialize;
@@ -21,6 +27,8 @@ pub(crate) enum SaveError {
     InvalidData,
     TooLarge,
     NoDownloadDir,
+    DownloadBusy,
+    QuarantineFailed(String),
     WriteFailed(String),
     OpenFailed(String),
 }
@@ -30,24 +38,36 @@ pub(crate) enum SaveError {
 /// is the only context that can read authenticated `files.slack.com` images,
 /// and JSON IPC makes a compact string cheaper than a raw byte array.
 #[tauri::command]
-pub(crate) fn save_image(
+pub(crate) async fn save_image(
     app_handle: tauri::AppHandle,
     filename: Option<String>,
     mime: Option<String>,
     data_base64: String,
 ) -> Result<String, SaveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_image_to_downloads(&app_handle, filename, mime, data_base64)
+    })
+    .await
+    .map_err(|error| SaveError::WriteFailed(error.to_string()))?
+}
+
+fn save_image_to_downloads(
+    app_handle: &tauri::AppHandle,
+    filename: Option<String>,
+    mime: Option<String>,
+    data_base64: String,
+) -> Result<String, SaveError> {
+    let _slot = acquire_save_slot()?;
     let data = decode_base64_payload(&data_base64, MAX_IMAGE_BYTES)?;
-    let dir = downloads_dir(&app_handle)?;
+    let dir = downloads_dir(app_handle)?;
 
     let filename = filename.unwrap_or_default();
     let mime = mime.unwrap_or_default();
     let stem = sanitize_stem(&filename, DEFAULT_STEM);
     let ext = image_extension(&data, &mime, &filename);
-    let target = unique_path(&dir, &stem, Some(ext));
+    let target = write_download(&dir, &stem, Some(ext), &data, quarantine)?;
 
-    std::fs::write(&target, &data).map_err(|error| SaveError::WriteFailed(error.to_string()))?;
-
-    notify_saved(&app_handle, "Image saved", &target, DEFAULT_STEM);
+    notify_saved(app_handle, "Image saved", &target, DEFAULT_STEM);
     Ok(target.to_string_lossy().into_owned())
 }
 
@@ -55,22 +75,33 @@ pub(crate) fn save_image(
 /// cookies. Unlike `save_image`, the extension comes from the caller-supplied
 /// filename alone — no image sniffing and no forced fallback extension.
 #[tauri::command]
-pub(crate) fn save_file(
+pub(crate) async fn save_file(
     app_handle: tauri::AppHandle,
     filename: Option<String>,
     data_base64: String,
 ) -> Result<String, SaveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_file_to_downloads(&app_handle, filename, data_base64)
+    })
+    .await
+    .map_err(|error| SaveError::WriteFailed(error.to_string()))?
+}
+
+fn save_file_to_downloads(
+    app_handle: &tauri::AppHandle,
+    filename: Option<String>,
+    data_base64: String,
+) -> Result<String, SaveError> {
+    let _slot = acquire_save_slot()?;
     let data = decode_base64_payload(&data_base64, MAX_FILE_BYTES)?;
-    let dir = downloads_dir(&app_handle)?;
+    let dir = downloads_dir(app_handle)?;
 
     let filename = filename.unwrap_or_default();
     let stem = sanitize_stem(&filename, DEFAULT_FILE_STEM);
     let ext = file_extension(&filename);
-    let target = unique_path(&dir, &stem, ext.as_deref());
+    let target = write_download(&dir, &stem, ext.as_deref(), &data, quarantine)?;
 
-    std::fs::write(&target, &data).map_err(|error| SaveError::WriteFailed(error.to_string()))?;
-
-    notify_saved(&app_handle, "File saved", &target, DEFAULT_FILE_STEM);
+    notify_saved(app_handle, "File saved", &target, DEFAULT_FILE_STEM);
     Ok(target.to_string_lossy().into_owned())
 }
 
@@ -87,7 +118,7 @@ fn decode_base64_payload(data_base64: &str, max_bytes: usize) -> Result<Vec<u8>,
         return Err(SaveError::EmptyData);
     }
     // base64 expands the payload ~4:3; reject obvious oversizes before decoding.
-    if data_base64.len() / 4 * 3 > max_bytes {
+    if data_base64.len() > max_bytes.div_ceil(3) * 4 {
         return Err(SaveError::TooLarge);
     }
 
@@ -136,7 +167,10 @@ fn sanitize_stem(filename: &str, default: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if c.is_control()
+                || is_format_char(c)
+                || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 c
@@ -148,8 +182,19 @@ fn sanitize_stem(filename: &str, default: &str) -> String {
     if trimmed.is_empty() {
         default.to_string()
     } else {
-        trimmed.chars().take(80).collect()
+        let mut end = trimmed.len().min(200);
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        trimmed[..end].to_owned()
     }
+}
+
+// Bidi control and invisible formatting characters can disguise the extension.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}'
+        | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{feff}')
 }
 
 /// Extension for a general file, taken from the caller-supplied name only.
@@ -243,24 +288,134 @@ fn extension_from_name(filename: &str) -> Option<&'static str> {
     }
 }
 
-/// Never clobber an existing file: fall back to `name (1).ext`, `name (2).ext`...
-/// Files without a usable extension get no trailing dot.
-fn unique_path(dir: &Path, stem: &str, ext: Option<&str>) -> PathBuf {
-    let name = |suffix: &str| match ext {
-        Some(ext) => format!("{stem}{suffix}.{ext}"),
-        None => format!("{stem}{suffix}"),
+fn acquire_save_slot() -> Result<MutexGuard<'static, Option<Instant>>, SaveError> {
+    static SLOT: Mutex<Option<Instant>> = Mutex::new(None);
+    const SAVE_INTERVAL: Duration = Duration::from_millis(250);
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    let deadline = Instant::now() + MAX_WAIT;
+    let mut slot = loop {
+        match SLOT.try_lock() {
+            Ok(slot) => break slot,
+            Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(SaveError::DownloadBusy);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+        }
     };
-    let first = dir.join(name(""));
-    if !first.exists() {
-        return first;
+    if let Some(started) = *slot {
+        let delay = SAVE_INTERVAL.saturating_sub(started.elapsed());
+        if delay > deadline.saturating_duration_since(Instant::now()) {
+            return Err(SaveError::DownloadBusy);
+        }
+        std::thread::sleep(delay);
     }
-    for n in 1..=9999u32 {
-        let candidate = dir.join(name(&format!(" ({n})")));
-        if !candidate.exists() {
-            return candidate;
+    *slot = Some(Instant::now());
+    Ok(slot)
+}
+
+/// Never clobber an existing file. Use a numbered suffix when a name is taken.
+fn write_download(
+    dir: &Path,
+    stem: &str,
+    extension: Option<&str>,
+    data: &[u8],
+    mark_quarantine: impl FnOnce(&File) -> io::Result<()>,
+) -> Result<PathBuf, SaveError> {
+    // Stage in a private directory on the destination filesystem. The final
+    // name appears atomically after all bytes are written and quarantine verified.
+    let stage = tempfile::Builder::new()
+        .prefix(".zlack-download-")
+        .tempdir_in(dir)
+        .map_err(write_error)?;
+    let staged_file = stage.path().join("download");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&staged_file).map_err(write_error)?;
+    mark_quarantine(&file).map_err(|error| SaveError::QuarantineFailed(error.to_string()))?;
+    file.write_all(data).map_err(write_error)?;
+    file.sync_all().map_err(write_error)?;
+    drop(file);
+
+    for n in 0..=9999 {
+        let mut name = if n == 0 {
+            stem.to_owned()
+        } else {
+            format!("{stem} ({n})")
+        };
+        if let Some(extension) = extension {
+            name.push('.');
+            name.push_str(extension);
+        }
+        let target = dir.join(name);
+        match std::fs::hard_link(&staged_file, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(write_error(error)),
         }
     }
-    first
+    Err(SaveError::WriteFailed(
+        "No available download filename".into(),
+    ))
+}
+
+fn write_error(error: io::Error) -> SaveError {
+    SaveError::WriteFailed(error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine(file: &File) -> io::Result<()> {
+    use std::{
+        os::fd::AsRawFd,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+    let value = format!("0081;{timestamp:08x};Zlack Trial;");
+    let name = c"com.apple.quarantine";
+    let fd = file.as_raw_fd();
+    // Both calls use the open staged file descriptor, independent of link names.
+    let written =
+        unsafe { libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) };
+    if written != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut actual = [0; 128];
+    let len = unsafe {
+        libc::fgetxattr(
+            fd,
+            name.as_ptr(),
+            actual.as_mut_ptr().cast(),
+            actual.len(),
+            0,
+            0,
+        )
+    };
+    if len < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if actual.get(..len as usize) != Some(value.as_bytes()) {
+        return Err(io::Error::other("Could not verify quarantine metadata"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quarantine(_: &File) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -353,33 +508,76 @@ mod tests {
     }
 
     #[test]
-    fn unique_path_avoids_overwrite() {
-        let dir = std::env::temp_dir().join(format!("zlack-save-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = unique_path(&dir, "img", Some("png"));
-        std::fs::write(&first, b"x").unwrap();
-        let second = unique_path(&dir, "img", Some("png"));
-        assert_ne!(first, second);
-        assert!(second
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap()
-            .contains("(1)"));
-        std::fs::remove_dir_all(&dir).ok();
+    fn concurrent_save_waits_for_the_native_slot() {
+        let first = acquire_save_slot().unwrap();
+        let started = first.unwrap();
+        std::thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let slot = acquire_save_slot().unwrap();
+                slot.unwrap()
+            });
+            drop(first);
+            assert!(second.join().unwrap().duration_since(started) >= Duration::from_millis(250));
+        });
     }
 
     #[test]
-    fn unique_path_handles_missing_extension() {
-        let dir = std::env::temp_dir().join(format!("zlack-save-noext-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = unique_path(&dir, "README", None);
-        assert_eq!(first.file_name().and_then(|n| n.to_str()), Some("README"));
-        std::fs::write(&first, b"x").unwrap();
-        let second = unique_path(&dir, "README", None);
-        assert_eq!(
-            second.file_name().and_then(|n| n.to_str()),
-            Some("README (1)")
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    fn publishes_concurrent_downloads_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let first = std::thread::scope(|scope| {
+            let work = scope.spawn(|| {
+                write_download(root, "report", Some("pdf"), b"first", |_| Ok(())).unwrap()
+            });
+            let second =
+                write_download(root, "report", Some("pdf"), b"second", |_| Ok(())).unwrap();
+            let first = work.join().unwrap();
+            assert_ne!(first, second);
+            assert_eq!(std::fs::read(second).unwrap(), b"second");
+            first
+        });
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_links_are_treated_as_name_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        std::fs::write(&original, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&original, dir.path().join("README")).unwrap();
+        let saved = write_download(dir.path(), "README", None, b"new", |_| Ok(())).unwrap();
+        assert_eq!(saved.file_name().unwrap(), "README (1)");
+        assert_eq!(std::fs::read(original).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read(saved).unwrap(), b"new");
+    }
+
+    #[test]
+    fn quarantine_failure_never_publishes_a_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = write_download(dir.path(), "report", Some("pdf"), b"data", |_| {
+            Err(io::Error::other("simulated quarantine failure"))
+        });
+        assert!(matches!(result, Err(SaveError::QuarantineFailed(_))));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn published_mac_download_has_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = write_download(dir.path(), "report", Some("pdf"), b"data", quarantine).unwrap();
+        // Check the public path independently of the descriptor used for writing.
+        let output = std::process::Command::new("/usr/bin/xattr")
+            .arg("-p")
+            .arg("com.apple.quarantine")
+            .arg(saved)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .contains(";Zlack Trial;"));
     }
 }

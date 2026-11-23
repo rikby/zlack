@@ -3,17 +3,15 @@
 // WKWebView (and WebView2/WebKitGTK under Tauri 1) silently drops
 // window.open() and target="_blank" navigations, so Slack's "Add a workspace"
 // actions ("Sign in to another workspace", "Find workspaces", "Create a new
-// workspace") did nothing (#9). Sign-in pages have to load in this WebView so
-// the new workspace's session cookie lands next to the existing ones; other
-// non-app Slack pages (help center, marketing, legal) go to the OS browser
-// like any other external link.
+// workspace") did nothing (#9). Native navigation opens sign-in with the
+// fork's shared session store. Other non-app Slack pages go to the OS browser.
 const ZlackSlackNavigation = (function buildSlackNavigation() {
   const SLACK_HOST_RE = /(^|\.)slack\.com$/i;
   // Hosts that serve files or APIs, never a page a user signs in on.
   const NON_PAGE_HOST_RE = /^(?:files|files-edge|files-origin|api|edgeapi|wss-[\w-]+|slack-imgs|ca|a|b|emoji|downloads|slackb)\.slack\.com$/i;
   const APP_PATH_RE = /^\/(?:client|archives)(?:\/|$)/i;
   // Account and workspace-onboarding flows.
-  const AUTH_PATH_RE = /^\/(?:signin|sign_in|workspace-signin|get-started|getstarted|create|ssb|checkcookie|checkmail|confirm|join|shared_invite|invite|sso|oauth|openid|forgot|reset|account\/(?:signin|sso)|x-\d+)(?:[\/?#._-]|$)/i;
+  const AUTH_PATH_RE = /^\/(?:signin|signout|sign_in|sign_out|auth|workspace-signin|get-started|getstarted|create|ssb|checkcookie|checkmail|confirm|join|shared_invite|invite|sso|oauth|openid|forgot|reset|account\/(?:signin|signout|sso)|x-\d+)(?:[\/?#._-]|$)/i;
 
   function parse(href, baseHref) {
     try {
@@ -43,14 +41,14 @@ const ZlackSlackNavigation = (function buildSlackNavigation() {
   }
 
   // 'app'      — Slack client route; existing in-app handling applies.
-  // 'signin'   — account/workspace flow; load in this WebView.
+  // 'signin'   — account/workspace flow; native policy opens sign-in.
   // 'external' — open in the OS browser.
   // null       — not a page Zlack should route (non-http, file/API host).
   function classify(href, baseHref) {
     if (typeof href !== 'string' || !href.trim()) return null;
     const url = parse(href, baseHref);
     if (!isHttp(url)) return null;
-    if (url.protocol !== 'https:' || !isSlackHost(url.hostname)) return 'external';
+    if (url.protocol !== 'https:' || url.port || !isSlackHost(url.hostname)) return 'external';
     if (url.username || url.password) return null;
     if (NON_PAGE_HOST_RE.test(url.hostname)) return null;
     if (APP_PATH_RE.test(url.pathname)) return 'app';
